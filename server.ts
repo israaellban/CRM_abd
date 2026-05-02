@@ -305,6 +305,7 @@ async function performInitialSync() {
       }
     }
     console.log("Initial sync completed.");
+    await updatePersistentSession();
   } catch (e) {
     console.error("Initial sync failed:", e);
   }
@@ -462,6 +463,25 @@ app.post("/api/mark-as-read", async (req, res) => {
 let phoneCodeHash = "";
 let phoneNumber = "";
 
+async function updatePersistentSession() {
+  try {
+    if (client && client.connected) {
+      const sessionString = client.session.save() as unknown as string;
+      if (sessionString) {
+        await supabase.from("settings").upsert({ 
+          key: "telegram_session", 
+          value: sessionString 
+        }, { onConflict: "key" });
+        // Also update local file
+        fs.writeFileSync(sessionPath, sessionString);
+        console.log("Persistent session updated in database.");
+      }
+    }
+  } catch (e) {
+    console.error("Failed to update persistent session:", e);
+  }
+}
+
 // API Routes
 app.post("/api/telegram/request-code", async (req, res) => {
   const { phone } = req.body;
@@ -504,6 +524,8 @@ app.post("/api/telegram/login", async (req, res) => {
     
     // Start sync after login
     performInitialSync();
+    // Force a session update to ensure string is persistent
+    setTimeout(() => updatePersistentSession(), 5000);
   } catch (e: any) {
     res.status(500).json({ error: e.message });
   }
@@ -776,7 +798,11 @@ async function startServer() {
 
   const session = new StringSession(savedSessionString);
   client = new TelegramClient(session, apiId, apiHash, {
-    connectionRetries: 5,
+    connectionRetries: 15,
+    deviceModel: "CRM-Dashboard-Server",
+    systemVersion: "Linux-NodeJS",
+    appVersion: "1.0.1",
+    useWSS: false,
   });
 
   try {
@@ -786,6 +812,8 @@ async function startServer() {
     if (await client.isUserAuthorized()) {
       console.log("Telegram is authorized.");
       performInitialSync();
+      // Setup periodic session update every 12 hours
+      setInterval(() => updatePersistentSession(), 12 * 60 * 60 * 1000);
     } else {
       console.log("Telegram is NOT authorized. Waiting for login...");
     }
