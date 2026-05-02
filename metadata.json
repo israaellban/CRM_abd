@@ -1,0 +1,6 @@
+{
+  "name": "TeleBridge Pro",
+  "description": "Enterprise-grade Telegram bridge with Supabase syncing, media uploads, and real-time dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
