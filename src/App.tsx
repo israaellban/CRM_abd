@@ -16,7 +16,7 @@ interface Message {
   text: string;
   type: string;
   media_url?: string;
-  filename?: string;
+  media_name?: string;
   reply_to_platform_id?: string;
   platform_message_id: string;
   sent_at: string;
@@ -626,11 +626,10 @@ export default function App() {
                               <Download className={`${msg.is_outgoing ? "text-indigo-100" : "text-indigo-600"}`} size={16} />
                             </div>
                             <div className="flex-1 overflow-hidden">
-                              <p className="text-[11px] font-bold truncate">{msg.filename || "Attachment"}</p>
+                              <p className="text-[11px] font-bold truncate">{msg.media_name || "Attachment"}</p>
                               {msg.media_url && (
                                 <a 
-                                  href={msg.media_url} 
-                                  download={msg.filename || "file"}
+                                  href={`/api/download?url=${encodeURIComponent(msg.media_url)}&filename=${encodeURIComponent(msg.media_name || "file")}`}
                                   target="_blank" 
                                   rel="noopener noreferrer" 
                                   className={`text-[9px] font-bold uppercase transition-opacity hover:opacity-100 ${msg.is_outgoing ? "text-indigo-200 opacity-70" : "text-indigo-600 opacity-80"}`}

@@ -7,6 +7,7 @@ import { StringSession } from "telegram/sessions";
 import { createClient } from "@supabase/supabase-js";
 import fs from "fs";
 import multer from "multer";
+import fetch from "node-fetch";
 import { Api } from "telegram/tl";
 import { NewMessage } from "telegram/events";
 import dotenv from "dotenv";
@@ -36,16 +37,9 @@ const upload = multer({ storage: multer.memoryStorage() });
 const apiId = parseInt(process.env.TELEGRAM_API_ID || "0");
 const apiHash = process.env.TELEGRAM_API_HASH || "";
 const sessionPath = path.join(process.cwd(), "session.txt");
-let sessionString = "";
 
-if (fs.existsSync(sessionPath)) {
-  sessionString = fs.readFileSync(sessionPath, "utf8");
-}
-
-const stringSession = new StringSession(sessionString);
-const client = new TelegramClient(stringSession, apiId, apiHash, {
-  connectionRetries: 5,
-});
+// We'll initialize this in startServer
+let client: TelegramClient;
 
 let meEntity: Api.User | null = null;
 
@@ -128,19 +122,21 @@ function sanitizeFilename(name: string): string {
   return name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
 }
 
-async function downloadMediaAndStore(message: Api.Message): Promise<{ type: string, url: string | null, filename: string | null }> {
+async function downloadMediaAndStore(message: Api.Message): Promise<{ type: string, url: string | null, media_name: string | null, mime_type: string }> {
   try {
-    if (!message.media) return { type: "text", url: null, filename: null };
+    if (!message.media) return { type: "text", url: null, media_name: null, mime_type: "text/plain" };
 
     let type = "file";
     let fileName = `tg-${message.id}-${Date.now()}`;
     let originalName = "";
     let fileSize = 0;
+    let mimeType = "application/octet-stream";
     
     if (message.media instanceof Api.MessageMediaPhoto) {
       type = "image";
       fileName += ".jpg";
       originalName = `photo-${message.id}.jpg`;
+      mimeType = "image/jpeg";
       if (message.media.photo instanceof Api.Photo) {
         const lastSize = message.media.photo.sizes[message.media.photo.sizes.length - 1];
         if ("size" in lastSize) fileSize = lastSize.size;
@@ -152,6 +148,8 @@ async function downloadMediaAndStore(message: Api.Message): Promise<{ type: stri
           ? (message.media.document.size as any).toJSNumber() 
           : Number(message.media.document.size);
         
+        mimeType = message.media.document.mimeType || "application/octet-stream";
+
         // Detect Voice Note
         const isVoice = message.media.document.attributes.find(a => a instanceof Api.DocumentAttributeVideo && a.roundMessage) || 
                        message.media.document.attributes.find(a => a instanceof Api.DocumentAttributeAudio && a.voice);
@@ -167,32 +165,36 @@ async function downloadMediaAndStore(message: Api.Message): Promise<{ type: stri
         }
       }
     } else {
-      return { type: "text", url: null, filename: null };
+      return { type: "text", url: null, media_name: null, mime_type: "text/plain" };
     }
 
     const MAX_SIZE = 45 * 1024 * 1024; 
     if (fileSize > MAX_SIZE) {
       console.warn(`Skipping media download: File too large (${(fileSize / (1024 * 1024)).toFixed(2)} MB)`);
-      return { type, url: null, filename: originalName || fileName };
+      return { type, url: null, media_name: originalName || fileName, mime_type: mimeType };
     }
 
     const buffer = await client.downloadMedia(message, {});
-    if (!buffer) return { type, url: null, filename: originalName || fileName };
+    if (!buffer) return { type, url: null, media_name: originalName || fileName, mime_type: mimeType };
 
     const { error: uploadErr } = await supabase.storage
       .from("media")
-      .upload(fileName, buffer, { upsert: true });
+      .upload(fileName, buffer, { 
+        contentType: mimeType,
+        cacheControl: "3600",
+        upsert: true 
+      });
 
     if (uploadErr) {
       console.error("Failed to upload downloaded TG media:", uploadErr);
-      return { type, url: null, filename: originalName || fileName };
+      return { type, url: null, media_name: originalName || fileName, mime_type: mimeType };
     }
 
     const { data: { publicUrl } } = supabase.storage.from("media").getPublicUrl(fileName);
-    return { type, url: publicUrl, filename: originalName || fileName };
+    return { type, url: publicUrl, media_name: originalName || fileName, mime_type: mimeType };
   } catch (e) {
     console.error("Media download/store failed:", e);
-    return { type: "text", url: null, filename: null };
+    return { type: "text", url: null, media_name: null, mime_type: "text/plain" };
   }
 }
 
@@ -244,7 +246,7 @@ async function performInitialSync() {
           const media = await downloadMediaAndStore(msg);
           msgType = media.type;
           mediaUrl = media.url;
-          originalFilename = media.filename;
+          originalFilename = media.media_name;
         }
 
         const replyToId = msg.replyTo instanceof Api.MessageReplyHeader ? msg.replyTo.replyToMsgId?.toString() : null;
@@ -256,7 +258,7 @@ async function performInitialSync() {
           text: msg.message || "",
           type: msgType,
           media_url: mediaUrl,
-          filename: originalFilename,
+          media_name: originalFilename,
           reply_to_platform_id: replyToId,
           sent_at: new Date(msg.date * 1000).toISOString(),
           is_outgoing: msg.out
@@ -274,85 +276,116 @@ async function performInitialSync() {
 }
 
 // Real-time listener
-client.addEventHandler(async (event) => {
-  const message = event.message;
-  if (!message) return;
+function setupHandlers() {
+  client.addEventHandler(async (event) => {
+    const message = event.message;
+    if (!message) return;
 
-  const chatId = message.chatId?.toString();
-  if (!chatId) return;
+    const chatId = message.chatId?.toString();
+    if (!chatId) return;
 
-  console.log("New message received in chat:", chatId, "Content:", message.message || "[Media]");
-
-  // Optimization: Check if message already exists
-  const { data: existingMsg } = await supabase
-    .from("messages")
-    .select("id")
-    .eq("chat_id", chatId)
-    .eq("platform_message_id", message.id.toString())
-    .maybeSingle();
-
-  if (existingMsg) {
-    console.log("Message already exists, skipping sync.");
-    return;
-  }
-
-  const participant = await resolveParticipant(chatId, message.fromId || message.peerId);
-  if (!participant) {
-    console.warn("Could not resolve participant for incoming message in chat:", chatId);
-  }
-
-  let msgType = "text";
-  let mediaUrl = null;
-  let originalFilename = null;
-  if (message.media) {
-    console.log("Downloading media for new message...");
-    const media = await downloadMediaAndStore(message);
-    msgType = media.type;
-    mediaUrl = media.url;
-    originalFilename = media.filename;
-    console.log("Media downloaded, URL:", mediaUrl);
-  }
-
-  const replyToId = message.replyTo instanceof Api.MessageReplyHeader ? message.replyTo.replyToMsgId?.toString() : null;
-
-  const { error: msgErr } = await supabase.from("messages").upsert({
-    chat_id: chatId,
-    platform_message_id: message.id.toString(),
-    sender_participant_id: participant?.id,
-    text: message.message || "",
-    type: msgType,
-    media_url: mediaUrl,
-    filename: originalFilename,
-    reply_to_platform_id: replyToId,
-    sent_at: new Date(message.date * 1000).toISOString(),
-    is_outgoing: message.out
-  }, { onConflict: "chat_id,platform_message_id" });
-
-  if (msgErr) {
-    console.error("Supabase Sync Error (Real-time):", JSON.stringify(msgErr, null, 2));
-  } else {
-    console.log("Message successfully synced to Supabase.");
-  }
-
-  // Update chat state
-  const updateData: any = {
-    last_message_at: new Date(message.date * 1000).toISOString(),
-  };
-
-  // Increment unread count for incoming messages
-  if (!message.out) {
-    const { data: currentChat } = await supabase
-      .from("chats")
-      .select("unread_count")
-      .eq("chat_id", chatId)
-      .maybeSingle();
+    console.log("New message received in chat:", chatId, "Content:", message.message || "[Media]");
     
-    updateData.unread_count = (currentChat?.unread_count || 0) + 1;
+    // ... same logic ...
+    // Optimization: Check if message already exists
+    const { data: existingMsg } = await supabase
+      .from("messages")
+      .select("id")
+      .eq("chat_id", chatId)
+      .eq("platform_message_id", message.id.toString())
+      .maybeSingle();
+
+    if (existingMsg) {
+      console.log("Message already exists, skipping sync.");
+      return;
+    }
+
+    const participant = await resolveParticipant(chatId, message.fromId || message.peerId);
+    if (!participant) {
+      console.warn("Could not resolve participant for incoming message in chat:", chatId);
+    }
+
+    let msgType = "text";
+    let mediaUrl = null;
+    let originalFilename = null;
+    if (message.media) {
+      console.log("Downloading media for new message...");
+      const media = await downloadMediaAndStore(message);
+      msgType = media.type;
+      mediaUrl = media.url;
+      originalFilename = media.media_name;
+      console.log("Media downloaded, URL:", mediaUrl);
+    }
+
+    const replyToId = message.replyTo instanceof Api.MessageReplyHeader ? message.replyTo.replyToMsgId?.toString() : null;
+
+    const { error: msgErr } = await supabase.from("messages").upsert({
+      chat_id: chatId,
+      platform_message_id: message.id.toString(),
+      sender_participant_id: participant?.id,
+      text: message.message || "",
+      type: msgType,
+      media_url: mediaUrl,
+      media_name: originalFilename,
+      reply_to_platform_id: replyToId,
+      sent_at: new Date(message.date * 1000).toISOString(),
+      is_outgoing: message.out
+    }, { onConflict: "chat_id,platform_message_id" });
+
+    if (msgErr) {
+      console.error("Supabase Sync Error (Real-time):", JSON.stringify(msgErr, null, 2));
+    } else {
+      console.log("Message successfully synced to Supabase.");
+    }
+
+    // Update chat state
+    const updateData: any = {
+      last_message_at: new Date(message.date * 1000).toISOString(),
+    };
+
+    // Increment unread count for incoming messages
+    if (!message.out) {
+      const { data: currentChat } = await supabase
+        .from("chats")
+        .select("unread_count")
+        .eq("chat_id", chatId)
+        .maybeSingle();
+      
+      updateData.unread_count = (currentChat?.unread_count || 0) + 1;
+    }
+
+    await supabase.from("chats").update(updateData).eq("chat_id", chatId);
+
+  }, new NewMessage({}));
+}
+
+// Download proxy to force "Save As"
+app.get("/api/download", async (req, res) => {
+  const { url, filename } = req.query;
+  if (!url) return res.status(400).send("Missing URL");
+
+  try {
+    const response = await fetch(url as string);
+    if (!response.ok) throw new Error(`Failed to fetch file: ${response.statusText}`);
+
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+    const safeFilename = encodeURIComponent(filename as string || "file")
+      .replace(/['()]/g, escape)
+      .replace(/\*/g, "%2A");
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader(
+      "Content-Disposition", 
+      `attachment; filename="${filename}"; filename*=UTF-8''${safeFilename}`
+    );
+
+    const buffer = await response.buffer();
+    res.send(buffer);
+  } catch (e) {
+    console.error("Download proxy error:", e);
+    res.status(500).send("Download failed");
   }
-
-  await supabase.from("chats").update(updateData).eq("chat_id", chatId);
-
-}, new NewMessage({}));
+});
 
 // Mark as read endpoint
 app.post("/api/mark-as-read", async (req, res) => {
@@ -421,8 +454,17 @@ app.post("/api/telegram/login", async (req, res) => {
       })
     );
     const session = client.session.save() as unknown as string;
+    
+    // Save to local file (fallback)
     fs.writeFileSync(sessionPath, session);
-    console.log("Session saved to:", sessionPath);
+    
+    // Save to Supabase (persistent)
+    await supabase.from("settings").upsert({ 
+      key: "telegram_session", 
+      value: session 
+    }, { onConflict: "key" });
+
+    console.log("Session saved to disk and database.");
     res.json({ success: true });
     
     // Start sync after login
@@ -524,7 +566,7 @@ app.post("/api/send", upload.single("file"), async (req, res) => {
         text: text || "",
         type: requestedType === "voice" ? "voice" : file.mimetype.startsWith("image/") ? "image" : "file",
         media_url: uploadedUrl,
-        filename: file.originalname || fileName,
+        media_name: file.originalname || fileName,
         reply_to_platform_id: reply_to_msg_id || null,
         sent_at: new Date().toISOString(),
         is_outgoing: true
@@ -602,17 +644,20 @@ app.post("/api/logout-full", async (req, res) => {
       }
     } catch (e) {}
 
-    // 3. Remove session file
+    // 3. Remove session from Supabase
+    await supabase.from("settings").delete().eq("key", "telegram_session");
+
+    // 4. Remove session file
     if (fs.existsSync(sessionPath)) {
       try {
         fs.unlinkSync(sessionPath);
-        console.log("Session file deleted at:", sessionPath);
+        console.log("Session file deleted.");
       } catch (e) {
         console.error("Failed to delete session file:", e);
       }
     }
     
-    // 4. Force restart
+    // 5. Force restart
     setTimeout(() => {
       console.log("Exiting process for fresh start.");
       process.exit(0);
@@ -627,7 +672,7 @@ app.post("/api/logout-full", async (req, res) => {
 });
 
 async function startServer() {
-  // 0. Ensure Storage Bucket exists
+  // 0. Ensure Storage Bucket and Settings table exist
   try {
     const { data: buckets } = await supabase.storage.listBuckets();
     if (!buckets?.find(b => b.name === "media")) {
@@ -638,13 +683,42 @@ async function startServer() {
     console.error("Storage bucket check failed:", e);
   }
 
-  // Connect Telegram
-  await client.connect();
-  if (await client.isUserAuthorized()) {
-    performInitialSync();
+  // Load Session from Supabase or disk
+  let savedSessionString = "";
+  try {
+    const { data: setting } = await supabase
+      .from("settings")
+      .select("value")
+      .eq("key", "telegram_session")
+      .maybeSingle();
+      
+    if (setting?.value) {
+      savedSessionString = setting.value;
+      console.log("Loaded session from Supabase.");
+    } else if (fs.existsSync(sessionPath)) {
+      savedSessionString = fs.readFileSync(sessionPath, "utf8");
+      console.log("Loaded session from disk.");
+    }
+  } catch (e) {
+    console.error("Failed to load session from Supabase:", e);
   }
 
-  // Vite setup
+  // Initialize Client
+  const session = new StringSession(savedSessionString);
+  client = new TelegramClient(session, apiId, apiHash, {
+    connectionRetries: 5,
+  });
+
+  // Connect Telegram
+  await client.connect();
+  setupHandlers();
+
+  if (await client.isUserAuthorized()) {
+    console.log("Telegram is authorized.");
+    performInitialSync();
+  } else {
+    console.log("Telegram is NOT authorized. Waiting for login...");
+  }
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
