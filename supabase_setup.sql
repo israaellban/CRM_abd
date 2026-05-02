@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS chats (
 -- 2. Participants Table
 CREATE TABLE IF NOT EXISTS participants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  chat_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
   external_user_id TEXT NOT NULL,
   display_name TEXT,
   username TEXT,
@@ -26,9 +26,9 @@ CREATE TABLE IF NOT EXISTS participants (
 -- 3. Messages Table
 CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  chat_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
   platform_message_id TEXT NOT NULL,
-  sender_participant_id UUID REFERENCES participants(id),
+  sender_participant_id UUID REFERENCES participants(id) ON DELETE CASCADE,
   text TEXT,
   type TEXT DEFAULT 'text',
   media_url TEXT,

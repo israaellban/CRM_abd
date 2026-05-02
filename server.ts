@@ -88,6 +88,28 @@ async function resolveParticipant(chatId: string, peer: any) {
       return null;
     }
 
+    // Ensure Chat exists in Supabase before participant (Safety net)
+    const { data: existingChat, error: chatCheckErr } = await supabase.from("chats").select("chat_id").eq("chat_id", chatId).maybeSingle();
+    
+    if (chatCheckErr) {
+      console.error(`Check chat ${chatId} error:`, chatCheckErr);
+    }
+
+    if (!existingChat) {
+      console.log(`Chat ${chatId} not found during participant resolution, creating stub...`);
+      const { error: chatStubErr } = await supabase.from("chats").upsert({
+        chat_id: String(chatId),
+        platform: "telegram",
+        chat_name: displayName || "New Chat",
+        chat_type: "private"
+      }, { onConflict: "chat_id" });
+      
+      if (chatStubErr) {
+        console.error(`Failed to create chat stub for ${chatId}:`, JSON.stringify(chatStubErr));
+        return null;
+      }
+    }
+
     const { data: participant, error } = await supabase
       .from("participants")
       .upsert({
@@ -97,10 +119,11 @@ async function resolveParticipant(chatId: string, peer: any) {
         username: username || "",
         is_self: !!isSelf
       }, { onConflict: "chat_id,external_user_id" })
-      .select();
+      .select("id")
+      .single();
 
     if (error) {
-      console.error("Supabase Error resolving participant (full):", JSON.stringify(error));
+      console.error("Supabase Error resolving participant (full):", JSON.stringify(error, null, 2));
       if (error.message.includes("row-level security policy")) {
         console.error("CRITICAL: RLS Policy Violation. You MUST run the SQL in supabase_setup.sql in your Supabase SQL Editor to allow writes.");
       }
@@ -110,7 +133,7 @@ async function resolveParticipant(chatId: string, peer: any) {
       return null;
     }
 
-    return participant && participant.length > 0 ? participant[0] : null;
+    return participant || null;
   } catch (e) {
     console.error("Failed to resolve participant exception:", e);
     return null;
@@ -221,6 +244,7 @@ async function performInitialSync() {
 
       if (chatSyncErr) {
         console.error(`Supabase Sync Error (Initial Sync - Chat ${chatId}):`, JSON.stringify(chatSyncErr, null, 2));
+        continue; // Prevent messages sync if chat sync failed
       }
 
       // 2. Sync Messages (Last 50)
@@ -237,6 +261,10 @@ async function performInitialSync() {
         if (existingMsg) continue;
 
         const participant = await resolveParticipant(chatId, msg.fromId || msg.peerId);
+        if (!participant) {
+          console.warn(`Skipping message ${msg.id} because participant couldn't be resolved.`);
+          continue;
+        }
         
         let msgType = "text";
         let mediaUrl = null;
@@ -266,6 +294,13 @@ async function performInitialSync() {
 
         if (msgErr) {
           console.error(`Supabase Sync Error (Initial Sync - Msg ${msg.id.toString()}):`, JSON.stringify(msgErr, null, 2));
+          console.error("Payload attempted:", JSON.stringify({
+            chat_id: chatId,
+            platform_message_id: msg.id.toString(),
+            sender_participant_id: participant?.id,
+            text: (msg.message || "").substring(0, 100),
+            type: msgType,
+          }, null, 2));
         }
       }
     }
@@ -630,22 +665,37 @@ app.post("/api/login", (req, res) => {
 
 app.post("/api/logout-full", async (req, res) => {
   try {
-    console.log("Full reset requested. Clearing session...");
+    console.log("Full reset requested. Clearing session and database...");
     
-    // 1. Send response first so UI can reload
-    if (!res.headersSent) {
-      res.json({ success: true, message: "Session cleared. Restarting..." });
+    // 1. Clear Supabase session and settings FIRST
+    console.log("Clearing database tables...");
+    await supabase.from("settings").delete().eq("key", "telegram_session");
+    
+    // 2. Clear ALL data tables (chats, messages, participants)
+    // We use a query that matches all rows
+    try {
+      await supabase.from("messages").delete().neq("chat_id", "STU_NONEXISTENT_ID");
+      await supabase.from("participants").delete().neq("chat_id", "STU_NONEXISTENT_ID");
+      await supabase.from("chats").delete().neq("chat_id", "STU_NONEXISTENT_ID");
+    } catch (dbErr) {
+      console.error("Database clear warning (ignoring):", dbErr);
     }
 
-    // 2. Disconnect and stop event handlers
-    try {
-      if (client.connected) {
-        await client.disconnect();
+    // 3. Try to log out from Telegram (if possible)
+    if (client) {
+      try {
+        if (client.connected) {
+          const isAuth = await client.isUserAuthorized().catch(() => false);
+          if (isAuth) {
+            console.log("Logging out from Telegram...");
+            await client.invoke(new Api.auth.LogOut()).catch(() => {});
+          }
+          await client.disconnect().catch(() => {});
+        }
+      } catch (e) {
+        console.warn("Telegram logout/disconnect failed (ignoring):", e);
       }
-    } catch (e) {}
-
-    // 3. Remove session from Supabase
-    await supabase.from("settings").delete().eq("key", "telegram_session");
+    }
 
     // 4. Remove session file
     if (fs.existsSync(sessionPath)) {
@@ -657,14 +707,16 @@ app.post("/api/logout-full", async (req, res) => {
       }
     }
     
-    // 5. Force restart
+    // 5. Send response
+    res.json({ success: true, message: "Session and data cleared. Restarting server..." });
+
+    // 6. Force restart
     setTimeout(() => {
       console.log("Exiting process for fresh start.");
       process.exit(0);
-    }, 500);
+    }, 1000);
   } catch (e: any) {
     console.error("Logout-full error:", e);
-    // If we can't send response (already sent), just log
     if (!res.headersSent) {
       res.status(500).json({ error: e.message });
     }
@@ -672,18 +724,37 @@ app.post("/api/logout-full", async (req, res) => {
 });
 
 async function startServer() {
-  // 0. Ensure Storage Bucket and Settings table exist
-  try {
-    const { data: buckets } = await supabase.storage.listBuckets();
+  // 0. (Optional) Run Supabase checks in background
+  supabase.storage.listBuckets().then(({ data: buckets }) => {
     if (!buckets?.find(b => b.name === "media")) {
-      await supabase.storage.createBucket("media", { public: true });
-      console.log("Created 'media' bucket in Supabase storage.");
+      supabase.storage.createBucket("media", { public: true }).then(() => {
+        console.log("Created 'media' bucket in Supabase storage.");
+      });
     }
-  } catch (e) {
-    console.error("Storage bucket check failed:", e);
+  }).catch(e => console.error("Storage bucket check failed:", e));
+
+  // Vite setup
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
   }
 
-  // Load Session from Supabase or disk
+  // START LISTENING FIRST
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running at http://0.0.0.0:${PORT}`);
+  });
+
+  // Load Session and Connect in Background
   let savedSessionString = "";
   try {
     const { data: setting } = await supabase
@@ -703,40 +774,24 @@ async function startServer() {
     console.error("Failed to load session from Supabase:", e);
   }
 
-  // Initialize Client
   const session = new StringSession(savedSessionString);
   client = new TelegramClient(session, apiId, apiHash, {
     connectionRetries: 5,
   });
 
-  // Connect Telegram
-  await client.connect();
-  setupHandlers();
+  try {
+    await client.connect();
+    setupHandlers();
 
-  if (await client.isUserAuthorized()) {
-    console.log("Telegram is authorized.");
-    performInitialSync();
-  } else {
-    console.log("Telegram is NOT authorized. Waiting for login...");
+    if (await client.isUserAuthorized()) {
+      console.log("Telegram is authorized.");
+      performInitialSync();
+    } else {
+      console.log("Telegram is NOT authorized. Waiting for login...");
+    }
+  } catch (e) {
+    console.error("Telegram connection background error:", e);
   }
-  if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running at http://0.0.0.0:${PORT}`);
-  });
 }
 
 startServer().catch(console.error);

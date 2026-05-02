@@ -49,48 +49,32 @@ export default function App() {
   const recordIntervalRef = useRef<number | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollAreaRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
 
   useEffect(() => {
     checkAuthStatus();
   }, []);
 
-  useEffect(() => {
-    if (isUnlocked && authStatus.isAuthorized) {
-      fetchChats();
-      const interval = setInterval(fetchChats, 10000);
-      return () => clearInterval(interval);
-    }
-  }, [isUnlocked, authStatus.isAuthorized]);
-
-  useEffect(() => {
-    if (selectedChat) {
-      fetchMessages(selectedChat.chat_id);
-      markAsRead(selectedChat.chat_id);
-      const interval = setInterval(() => fetchMessages(selectedChat.chat_id), 3000);
-      return () => clearInterval(interval);
-    }
-  }, [selectedChat]);
-
-  const markAsRead = async (chatId: string) => {
-    try {
-      await fetch("/api/mark-as-read", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId }),
-      });
-      setChats(prev => prev.map(c => c.chat_id === chatId ? { ...c, unread_count: 0 } : c));
-    } catch (e) {
-      console.error("Failed to mark as read", e);
-    }
+  const handleScroll = () => {
+    if (!scrollAreaRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollAreaRef.current;
+    // If we're within 100px of bottom, enable auto-scroll
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 100;
+    setShouldAutoScroll(isAtBottom);
   };
 
   useEffect(() => {
-    scrollToBottom();
+    if (shouldAutoScroll) {
+      scrollToBottom();
+    }
   }, [messages]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const scrollToBottom = (force = false) => {
+    if (force || shouldAutoScroll) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   };
 
   const checkAuthStatus = async () => {
@@ -122,30 +106,67 @@ export default function App() {
   };
 
   const handleFullLogout = async () => {
-    if (window.confirm("Are you sure? This will clear the Telegram session and restart the server.")) {
-      setIsLoading(true);
-      try {
-        const res = await fetch("/api/logout-full", { method: "POST" });
-        if (res.ok) {
-          // Clear all local auth states
-          setAuthStatus({ isConnected: false, isAuthorized: false });
-          setPhone("");
-          setLoginStep(0);
-          setIsUnlocked(false);
-          setPassword("");
-          setEmail("");
-          setMessages([]);
-          setSelectedChat(null);
-          // Give the server time to reboot then reload
-          setTimeout(() => {
-            window.location.reload();
-          }, 3000);
-        }
-      } catch (e) {
-        alert("Failed to reset session");
-      } finally {
-        setIsLoading(false);
+    // Direct logout for better reliability in framing environments
+    setIsLoading(true);
+    try {
+      console.log("Triggering full logout...");
+      const res = await fetch("/api/logout-full", { method: "POST" });
+      if (res.ok) {
+        // Clear all local auth states
+        setAuthStatus({ isConnected: false, isAuthorized: false });
+        setPhone("");
+        setLoginStep(0);
+        setIsUnlocked(false);
+        setPassword("");
+        setEmail("");
+        setMessages([]);
+        setSelectedChat(null);
+        // Success alert
+        alert("Session reset successful. The page will reload.");
+        setTimeout(() => {
+          window.location.reload();
+        }, 1500);
+      } else {
+        const err = await res.json();
+        alert("Reset failed: " + (err.error || "Server error"));
       }
+    } catch (e) {
+      console.error("Reset fetch error:", e);
+      alert("Failed to connect to server for reset.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isUnlocked && authStatus.isAuthorized) {
+      fetchChats();
+      const interval = setInterval(fetchChats, 10000);
+      return () => clearInterval(interval);
+    }
+  }, [isUnlocked, authStatus.isAuthorized]);
+
+  useEffect(() => {
+    if (selectedChat) {
+      setMessages([]); // Clear messages when switching chats
+      setShouldAutoScroll(true); // Auto scroll to bottom of new chat
+      fetchMessages(selectedChat.chat_id);
+      markAsRead(selectedChat.chat_id);
+      const interval = setInterval(() => fetchMessages(selectedChat.chat_id), 3000);
+      return () => clearInterval(interval);
+    }
+  }, [selectedChat]);
+
+  const markAsRead = async (chatId: string) => {
+    try {
+      await fetch("/api/mark-as-read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId }),
+      });
+      setChats(prev => prev.map(c => c.chat_id === chatId ? { ...c, unread_count: 0 } : c));
+    } catch (e) {
+      console.error("Failed to mark as read", e);
     }
   };
 
@@ -221,6 +242,8 @@ export default function App() {
         setReplyingTo(null);
         if (fileInputRef.current) fileInputRef.current.value = "";
         await fetchMessages(selectedChat.chat_id);
+        setShouldAutoScroll(true); // Force scroll on my own message
+        setTimeout(() => scrollToBottom(true), 100);
       }
     } catch (e) {
       console.error("Failed to send", e);
@@ -429,9 +452,32 @@ export default function App() {
                 >
                   Back to Phone Number
                 </button>
+                <div className="pt-4 border-t border-gray-100 flex justify-center">
+                  <button 
+                    type="button"
+                    onClick={handleFullLogout}
+                    className="text-red-500 hover:text-red-600 text-[10px] font-bold uppercase tracking-widest transition-colors flex items-center gap-1.5"
+                  >
+                    <RefreshCw size={12} />
+                    Reset & Start Over
+                  </button>
+                </div>
               </motion.form>
             )}
           </AnimatePresence>
+          
+          {loginStep === 0 && (
+            <div className="mt-8 pt-4 border-t border-gray-100 flex justify-center">
+              <button 
+                type="button"
+                onClick={handleFullLogout}
+                className="text-gray-400 hover:text-red-500 text-[10px] font-bold uppercase tracking-widest transition-colors flex items-center gap-1.5"
+              >
+                <RefreshCw size={12} />
+                Reset Current Session
+              </button>
+            </div>
+          )}
         </motion.div>
       </div>
     );
@@ -554,7 +600,11 @@ export default function App() {
             </header>
 
             {/* Messages Area */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            <div 
+              ref={scrollAreaRef}
+              onScroll={handleScroll}
+              className="flex-1 overflow-y-auto p-6 space-y-4"
+            >
               <div className="flex flex-col items-center mb-6">
                 <span className="text-[10px] font-bold text-gray-400 bg-white px-3 py-1 rounded-full shadow-sm border border-gray-100 tracking-widest">TODAY</span>
               </div>
