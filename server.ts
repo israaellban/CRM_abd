@@ -39,14 +39,34 @@ const apiHash = process.env.TELEGRAM_API_HASH || "";
 const sessionPath = path.join(process.cwd(), "session.txt");
 
 // We'll initialize this in startServer
-let client: TelegramClient;
-
+let client: TelegramClient | null = null;
+let isSyncing = false;
 let meEntity: Api.User | null = null;
+
+// Health check for infrastructure
+app.get("/health", (req, res) => res.send("ok"));
+
+// Middleware to ensure client is ready for Telegram routes
+const ensureClient = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (!client) {
+    return res.status(503).json({ error: "Telegram service is starting up. Please wait." });
+  }
+  next();
+};
+
+app.get("/api/telegram/status", (req, res) => {
+  res.json({
+    initialized: !!client,
+    connected: client?.connected || false,
+    syncing: isSyncing
+  });
+});
 
 // Helper: Resolve Participant
 async function resolveParticipant(chatId: string, peer: any) {
+  if (!client || !client.connected) return null;
   try {
-    if (!meEntity && client.connected) {
+    if (!meEntity) {
       try {
         const me = await client.getMe();
         if (me instanceof Api.User) meEntity = me;
@@ -223,10 +243,25 @@ async function downloadMediaAndStore(message: Api.Message): Promise<{ type: stri
 
 // Initial Sync
 async function performInitialSync() {
+  if (isSyncing) return;
+  isSyncing = true;
   console.log("Starting initial sync...");
   try {
+    // Check connection first
+    if (!client || !client.connected) {
+      console.log("Sync deferred: Client not connected.");
+      isSyncing = false;
+      return;
+    }
+
     const dialogs = await client.getDialogs({ limit: 50 });
     for (const dialog of dialogs) {
+      // Periodic connection check during long loop
+      if (!client || !client.connected) {
+        console.warn("Sync interrupted: Lost connection. Stopping current sync pass.");
+        break;
+      }
+
       const chatId = dialog.id.toString();
       const chatName = dialog.title || "Unknown Chat";
       //@ts-ignore
@@ -244,70 +279,92 @@ async function performInitialSync() {
 
       if (chatSyncErr) {
         console.error(`Supabase Sync Error (Initial Sync - Chat ${chatId}):`, JSON.stringify(chatSyncErr, null, 2));
-        continue; // Prevent messages sync if chat sync failed
+        continue;
       }
 
       // 2. Sync Messages (Last 50)
+      if (!client || !client.connected) break;
+      
       const messages = await client.getMessages(dialog.id, { limit: 50 });
       for (const msg of messages) {
-        // Optimization: Check if message already exists to avoid re-downloading media
-        const { data: existingMsg } = await supabase
-          .from("messages")
-          .select("id")
-          .eq("chat_id", chatId)
-          .eq("platform_message_id", msg.id.toString())
-          .maybeSingle();
+        try {
+          // Double check connection for resolveParticipant which calls Telegram
+          if (!client || !client.connected) break;
 
-        if (existingMsg) continue;
+          // Optimization: Check if message already exists
+          const { data: existingMsg } = await supabase
+            .from("messages")
+            .select("id")
+            .eq("chat_id", chatId)
+            .eq("platform_message_id", msg.id.toString())
+            .maybeSingle();
 
-        const participant = await resolveParticipant(chatId, msg.fromId || msg.peerId);
-        if (!participant) {
-          console.warn(`Skipping message ${msg.id} because participant couldn't be resolved.`);
-          continue;
-        }
-        
-        let msgType = "text";
-        let mediaUrl = null;
-        let originalFilename = null;
+          if (existingMsg) continue;
 
-        if (msg.media) {
-          const media = await downloadMediaAndStore(msg);
-          msgType = media.type;
-          mediaUrl = media.url;
-          originalFilename = media.media_name;
-        }
+          const participant = await resolveParticipant(chatId, msg.fromId || msg.peerId);
+          if (!participant) {
+            console.warn(`Skipping message ${msg.id} because participant couldn't be resolved.`);
+            continue;
+          }
+          
+          let msgType = "text";
+          let mediaUrl = null;
+          let originalFilename = null;
 
-        const replyToId = msg.replyTo instanceof Api.MessageReplyHeader ? msg.replyTo.replyToMsgId?.toString() : null;
+          if (msg.media) {
+            // Careful: downloadMedia is heavy and can drop connection
+            if (!client || !client.connected) break;
+            try {
+              const media = await downloadMediaAndStore(msg);
+              msgType = media.type;
+              mediaUrl = media.url;
+              originalFilename = media.media_name;
+            } catch (mediaErr) {
+              console.error(`Media download failed for msg ${msg.id}:`, mediaErr);
+              msgType = "unsupported"; // Fallback to avoid stopping sync
+            }
+          }
 
-        const { error: msgErr } = await supabase.from("messages").upsert({
-          chat_id: chatId,
-          platform_message_id: msg.id.toString(),
-          sender_participant_id: participant?.id,
-          text: msg.message || "",
-          type: msgType,
-          media_url: mediaUrl,
-          media_name: originalFilename,
-          reply_to_platform_id: replyToId,
-          sent_at: new Date(msg.date * 1000).toISOString(),
-          is_outgoing: msg.out
-        }, { onConflict: "chat_id,platform_message_id" });
+          const replyToId = msg.replyTo instanceof Api.MessageReplyHeader ? msg.replyTo.replyToMsgId?.toString() : null;
 
-        if (msgErr) {
-          console.error(`Supabase Sync Error (Initial Sync - Msg ${msg.id.toString()}):`, JSON.stringify(msgErr, null, 2));
-          console.error("Payload attempted:", JSON.stringify({
+          const { error: msgErr } = await supabase.from("messages").upsert({
             chat_id: chatId,
             platform_message_id: msg.id.toString(),
             sender_participant_id: participant?.id,
-            text: (msg.message || "").substring(0, 100),
+            text: msg.message || "",
             type: msgType,
-          }, null, 2));
+            media_url: mediaUrl,
+            media_name: originalFilename,
+            reply_to_platform_id: replyToId,
+            sent_at: new Date(msg.date * 1000).toISOString(),
+            is_outgoing: msg.out
+          }, { onConflict: "chat_id,platform_message_id" });
+
+          if (msgErr) {
+            console.error(`Supabase Sync Error (Initial Sync - Msg ${msg.id.toString()}):`, JSON.stringify(msgErr, null, 2));
+            console.error("Payload attempted:", JSON.stringify({
+              chat_id: chatId,
+              platform_message_id: msg.id.toString(),
+              sender_participant_id: participant?.id,
+              text: (msg.message || "").substring(0, 500),
+              type: msgType,
+              sent_at: new Date(msg.date * 1000).toISOString(),
+              is_outgoing: msg.out
+            }, null, 2));
+          }
+        } catch (msgSyncErr) {
+          console.error(`Unexpected error syncing message ${msg?.id}:`, msgSyncErr);
         }
       }
+      // Small pause between chats to let event loop breathe
+      await new Promise(r => setTimeout(r, 100));
     }
     console.log("Initial sync completed.");
     await updatePersistentSession();
   } catch (e) {
     console.error("Initial sync failed:", e);
+  } finally {
+    isSyncing = false;
   }
 }
 
@@ -424,14 +481,14 @@ app.get("/api/download", async (req, res) => {
 });
 
 // Mark as read endpoint
-app.post("/api/mark-as-read", async (req, res) => {
+app.post("/api/mark-as-read", ensureClient, async (req, res) => {
   const { chat_id } = req.body;
   if (!chat_id) return res.status(400).json({ error: "Missing chat_id" });
 
   try {
     // 1. Mark as read in Telegram
     try {
-      if (client.connected) {
+      if (client?.connected) {
         // Need the entity to read history
         const entity = await client.getEntity(chat_id);
         await client.invoke(
@@ -466,15 +523,17 @@ let phoneNumber = "";
 async function updatePersistentSession() {
   try {
     if (client && client.connected) {
+      const isAuth = await client.isUserAuthorized().catch(() => false);
+      if (!isAuth) return;
+
       const sessionString = client.session.save() as unknown as string;
       if (sessionString) {
         await supabase.from("settings").upsert({ 
           key: "telegram_session", 
           value: sessionString 
         }, { onConflict: "key" });
-        // Also update local file
         fs.writeFileSync(sessionPath, sessionString);
-        console.log("Persistent session updated in database.");
+        console.log("Persistent session reinforced in DB and Disk.");
       }
     }
   } catch (e) {
@@ -483,11 +542,11 @@ async function updatePersistentSession() {
 }
 
 // API Routes
-app.post("/api/telegram/request-code", async (req, res) => {
+app.post("/api/telegram/request-code", ensureClient, async (req, res) => {
   const { phone } = req.body;
   phoneNumber = phone;
   try {
-    const result = await client.sendCode(
+    const result = await client!.sendCode(
       { apiId, apiHash },
       phone
     );
@@ -498,10 +557,10 @@ app.post("/api/telegram/request-code", async (req, res) => {
   }
 });
 
-app.post("/api/telegram/login", async (req, res) => {
+app.post("/api/telegram/login", ensureClient, async (req, res) => {
   const { code } = req.body;
   try {
-    await client.invoke(
+    await client!.invoke(
       new Api.auth.SignIn({
         phoneNumber: phoneNumber,
         phoneCodeHash: phoneCodeHash,
@@ -532,9 +591,9 @@ app.post("/api/telegram/login", async (req, res) => {
 });
 
 app.get("/api/auth-status", async (req, res) => {
-  const isConnected = client.connected;
+  const isConnected = client?.connected || false;
   let isAuthorized = false;
-  if (isConnected) {
+  if (isConnected && client) {
     isAuthorized = await client.isUserAuthorized();
   }
   res.json({ isConnected, isAuthorized });
@@ -567,7 +626,7 @@ app.get("/api/messages", async (req, res) => {
   res.json(data);
 });
 
-app.post("/api/send", upload.single("file"), async (req, res) => {
+app.post("/api/send", upload.single("file"), ensureClient, async (req, res) => {
   const { chat_id, text, reply_to_msg_id, type: requestedType } = req.body;
   const file = req.file;
 
@@ -603,7 +662,7 @@ app.post("/api/send", upload.single("file"), async (req, res) => {
         .getPublicUrl(fileName);
 
       // 2. Send to Telegram
-      const result = await client.sendFile(chat_id, {
+      const result = await client!.sendFile(chat_id, {
         file: file.buffer,
         caption: text || "",
         replyTo: reply_to_msg_id ? parseInt(reply_to_msg_id) : undefined,
@@ -639,7 +698,7 @@ app.post("/api/send", upload.single("file"), async (req, res) => {
 
       res.json({ success: true, media_url: uploadedUrl });
     } else {
-      const sentMsg = await client.sendMessage(chat_id, { 
+      const sentMsg = await client!.sendMessage(chat_id, { 
         message: text,
         replyTo: reply_to_msg_id ? parseInt(reply_to_msg_id) : undefined
       });
@@ -746,23 +805,28 @@ app.post("/api/logout-full", async (req, res) => {
 });
 
 async function startServer() {
-  // 0. (Optional) Run Supabase checks in background
-  supabase.storage.listBuckets().then(({ data: buckets }) => {
-    if (!buckets?.find(b => b.name === "media")) {
-      supabase.storage.createBucket("media", { public: true }).then(() => {
-        console.log("Created 'media' bucket in Supabase storage.");
-      });
-    }
-  }).catch(e => console.error("Storage bucket check failed:", e));
+  console.log(">>> Express server starting up...");
 
-  // Vite setup
+  // Start listening immediately so the infrastructure sees the port as open
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`>>> Web server active at http://0.0.0.0:${PORT} <<<`);
+  });
+
+  // Handle Vite setup
   if (process.env.NODE_ENV !== "production") {
-    const { createServer: createViteServer } = await import("vite");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
+    try {
+      console.log("Initializing Vite middleware...");
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      // Important to use the middleware
+      app.use(vite.middlewares);
+      console.log("Vite middleware attached.");
+    } catch (e) {
+      console.error("Vite initialization failed:", e);
+    }
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
@@ -771,12 +835,25 @@ async function startServer() {
     });
   }
 
-  // START LISTENING FIRST
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running at http://0.0.0.0:${PORT}`);
+  // 3. Background Services
+  initializeBackgroundServices().catch(err => {
+    console.error("Background services initialization error:", err);
   });
+}
 
-  // Load Session and Connect in Background
+async function initializeBackgroundServices() {
+  console.log("Initializing BG services...");
+
+  // Supabase bucket check
+  supabase.storage.listBuckets().then(({ data: buckets }) => {
+    if (!buckets?.find(b => b.name === "media")) {
+      supabase.storage.createBucket("media", { public: true }).then(() => {
+        console.log("Media bucket created.");
+      });
+    }
+  }).catch(e => console.error("Bucket check err:", e));
+
+  // Load Session
   let savedSessionString = "";
   try {
     const { data: setting } = await supabase
@@ -787,39 +864,62 @@ async function startServer() {
       
     if (setting?.value) {
       savedSessionString = setting.value;
-      console.log("Loaded session from Supabase.");
+      console.log("Session loaded from DB.");
     } else if (fs.existsSync(sessionPath)) {
       savedSessionString = fs.readFileSync(sessionPath, "utf8");
-      console.log("Loaded session from disk.");
+      console.log("Session loaded from disk.");
     }
   } catch (e) {
-    console.error("Failed to load session from Supabase:", e);
+    console.warn("Session load warning:", e);
   }
 
   const session = new StringSession(savedSessionString);
   client = new TelegramClient(session, apiId, apiHash, {
-    connectionRetries: 15,
+    connectionRetries: 1000,
+    autoReconnect: true,
     deviceModel: "CRM-Dashboard-Server",
     systemVersion: "Linux-NodeJS",
-    appVersion: "1.0.1",
+    appVersion: "1.0.5",
     useWSS: false,
   });
 
   try {
+    console.log("Connecting to Telegram in background...");
     await client.connect();
+
     setupHandlers();
 
+    // Initial sync
     if (await client.isUserAuthorized()) {
-      console.log("Telegram is authorized.");
+      console.log("Telegram Authorized.");
       performInitialSync();
-      // Setup periodic session update every 12 hours
-      setInterval(() => updatePersistentSession(), 12 * 60 * 60 * 1000);
+      
+      // Setup periodic session update every 6 hours
+      setInterval(() => updatePersistentSession(), 6 * 60 * 60 * 1000);
+      
+      // Keep-alive: Ping Telegram every 1 hour
+      setInterval(async () => {
+        try {
+          if (client?.connected) {
+            await client.getMe().catch(() => {});
+            console.log("Session Keep-alive: Ping processed.");
+          }
+        } catch (e) {
+          console.warn("Keep-alive ping failed:", e);
+        }
+      }, 60 * 60 * 1000);
     } else {
-      console.log("Telegram is NOT authorized. Waiting for login...");
+      console.log("Telegram Unauthorised - login required.");
     }
   } catch (e) {
-    console.error("Telegram connection background error:", e);
+    console.error("TG-BG connection err:", e);
   }
 }
 
-startServer().catch(console.error);
+startServer().catch(err => {
+  console.error("FATAL startup failure:", err);
+  // Fallback listen
+  if (!app.listen) {
+    app.listen(PORT, "0.0.0.0");
+  }
+});
