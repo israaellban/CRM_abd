@@ -41,6 +41,7 @@ const sessionPath = path.join(process.cwd(), "session.txt");
 // We'll initialize this in startServer
 let client: TelegramClient | null = null;
 let isSyncing = false;
+let isResetting = false;
 let meEntity: Api.User | null = null;
 
 // Health check for infrastructure
@@ -107,6 +108,8 @@ async function resolveParticipant(chatId: string, peer: any) {
       console.error("Critical: Could not resolve externalUserId for chatId:", chatId);
       return null;
     }
+
+    if (isResetting) return null;
 
     // Ensure Chat exists in Supabase before participant (Safety net)
     const { data: existingChat, error: chatCheckErr } = await supabase.from("chats").select("chat_id").eq("chat_id", chatId).maybeSingle();
@@ -288,8 +291,8 @@ async function performInitialSync() {
       const messages = await client.getMessages(dialog.id, { limit: 50 });
       for (const msg of messages) {
         try {
-          // Double check connection for resolveParticipant which calls Telegram
-          if (!client || !client.connected) break;
+          // Double check connection or reset state
+          if (!client || !client.connected || isResetting) break;
 
           // Optimization: Check if message already exists
           const { data: existingMsg } = await supabase
@@ -299,11 +302,11 @@ async function performInitialSync() {
             .eq("platform_message_id", msg.id.toString())
             .maybeSingle();
 
-          if (existingMsg) continue;
+          if (existingMsg || isResetting) continue;
 
           const participant = await resolveParticipant(chatId, msg.fromId || msg.peerId);
-          if (!participant) {
-            console.warn(`Skipping message ${msg.id} because participant couldn't be resolved.`);
+          if (!participant || isResetting) {
+            console.warn(`Skipping message ${msg.id} because participant couldn't be resolved or reset in progress.`);
             continue;
           }
           
@@ -313,9 +316,10 @@ async function performInitialSync() {
 
           if (msg.media) {
             // Careful: downloadMedia is heavy and can drop connection
-            if (!client || !client.connected) break;
+            if (!client || !client.connected || isResetting) break;
             try {
               const media = await downloadMediaAndStore(msg);
+              if (isResetting) break;
               msgType = media.type;
               mediaUrl = media.url;
               originalFilename = media.media_name;
@@ -325,6 +329,7 @@ async function performInitialSync() {
             }
           }
 
+          if (isResetting) break;
           const replyToId = msg.replyTo instanceof Api.MessageReplyHeader ? msg.replyTo.replyToMsgId?.toString() : null;
 
           const { error: msgErr } = await supabase.from("messages").upsert({
@@ -341,16 +346,23 @@ async function performInitialSync() {
           }, { onConflict: "chat_id,platform_message_id" });
 
           if (msgErr) {
-            console.error(`Supabase Sync Error (Initial Sync - Msg ${msg.id.toString()}):`, JSON.stringify(msgErr, null, 2));
-            console.error("Payload attempted:", JSON.stringify({
-              chat_id: chatId,
-              platform_message_id: msg.id.toString(),
-              sender_participant_id: participant?.id,
-              text: (msg.message || "").substring(0, 500),
-              type: msgType,
-              sent_at: new Date(msg.date * 1000).toISOString(),
-              is_outgoing: msg.out
-            }, null, 2));
+            if (msgErr.code === "23503" && !isResetting) {
+               console.warn("FK violation during sync. Retrying participant resolution once...");
+               const pRetry = await resolveParticipant(chatId, msg.fromId || msg.peerId);
+               if (pRetry) {
+                 await supabase.from("messages").upsert({
+                    chat_id: chatId,
+                    platform_message_id: msg.id.toString(),
+                    sender_participant_id: pRetry.id,
+                    text: msg.message || "",
+                    type: msgType,
+                    sent_at: new Date(msg.date * 1000).toISOString(),
+                    is_outgoing: msg.out
+                 });
+               }
+            } else {
+              console.error(`Supabase Sync Error (Initial Sync - Msg ${msg.id.toString()}):`, JSON.stringify(msgErr, null, 2));
+            }
           }
         } catch (msgSyncErr) {
           console.error(`Unexpected error syncing message ${msg?.id}:`, msgSyncErr);
@@ -747,14 +759,16 @@ app.post("/api/login", (req, res) => {
 app.post("/api/logout-full", async (req, res) => {
   try {
     console.log("Full reset requested. Clearing session and database...");
+    isResetting = true;
     
     // 1. Clear Supabase session and settings FIRST
     console.log("Clearing database tables...");
     await supabase.from("settings").delete().eq("key", "telegram_session");
     
     // 2. Clear ALL data tables (chats, messages, participants)
-    // We use a query that matches all rows
     try {
+      // Small delay to allow running sync loops to reach a safe break point
+      await new Promise(r => setTimeout(r, 500));
       await supabase.from("messages").delete().neq("chat_id", "STU_NONEXISTENT_ID");
       await supabase.from("participants").delete().neq("chat_id", "STU_NONEXISTENT_ID");
       await supabase.from("chats").delete().neq("chat_id", "STU_NONEXISTENT_ID");
@@ -788,6 +802,7 @@ app.post("/api/logout-full", async (req, res) => {
       }
     }
     
+    isResetting = false;
     // 5. Send response
     res.json({ success: true, message: "Session and data cleared. Restarting server..." });
 
@@ -797,6 +812,7 @@ app.post("/api/logout-full", async (req, res) => {
       process.exit(0);
     }, 1000);
   } catch (e: any) {
+    isResetting = false;
     console.error("Logout-full error:", e);
     if (!res.headersSent) {
       res.status(500).json({ error: e.message });
@@ -806,11 +822,6 @@ app.post("/api/logout-full", async (req, res) => {
 
 async function startServer() {
   console.log(">>> Express server starting up...");
-
-  // Start listening immediately so the infrastructure sees the port as open
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`>>> Web server active at http://0.0.0.0:${PORT} <<<`);
-  });
 
   // Handle Vite setup
   if (process.env.NODE_ENV !== "production") {
@@ -835,9 +846,16 @@ async function startServer() {
     });
   }
 
-  // 3. Background Services
-  initializeBackgroundServices().catch(err => {
-    console.error("Background services initialization error:", err);
+  // Start listening after middleware is ready (so requests don't hang)
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`>>> Web server active at http://0.0.0.0:${PORT} <<<`);
+  });
+
+  // 3. Background Services (strictly non-blocking)
+  setImmediate(() => {
+    initializeBackgroundServices().catch(err => {
+      console.error("Background services initialization error:", err);
+    });
   });
 }
 
@@ -903,6 +921,8 @@ async function initializeBackgroundServices() {
           if (client?.connected) {
             await client.getMe().catch(() => {});
             console.log("Session Keep-alive: Ping processed.");
+            // Also reinforce the session string in DB
+            await updatePersistentSession();
           }
         } catch (e) {
           console.warn("Keep-alive ping failed:", e);
